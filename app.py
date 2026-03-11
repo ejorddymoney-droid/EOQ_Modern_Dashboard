@@ -19,23 +19,56 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- DEFENSIVE DATA ENGINE ---
+# --- ADVANCED DATA ENGINE (Finds headers automatically) ---
 def load_live_data():
-    url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTRBP7-Jh2bfZF7BbU13MSw_5p0oESN3xvAQd9R-0SxHSqNjPiGYI5LqfwokRXBcMMTUcLEgzfWaiUm/pub?output=csv"
+    # YOUR UPDATED LINK
+    url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTRBP7-Jh2bfZF7BbU13MSw_5p0oESN3xvAQd9R-0SxHSqNjPiGYI5LqfwokRXBcMMTUcLEgzfWaiUm/pub?gid=438856952&single=true&output=csv"
+    
     try:
-        df = pd.read_csv(url)
-        # Clean headers: remove spaces, handle special characters
+        # Read the whole sheet first
+        raw_df = pd.read_csv(url, header=None)
+        
+        # FIND THE HEADER ROW: Look for the row containing "Article" or "Annual Value"
+        header_row_index = 0
+        for i, row in raw_df.iterrows():
+            row_str = " ".join([str(val).lower() for val in row.values])
+            if "article" in row_str or "annual" in row_str:
+                header_row_index = i
+                break
+        
+        # Re-read or slice the dataframe from the correct header
+        df = raw_df.iloc[header_row_index:].copy()
+        df.columns = df.iloc[0] # Set the found row as header
+        df = df[1:].reset_index(drop=True) # Remove the header row from the data
+        
+        # Clean column names
         df.columns = [str(c).strip() for c in df.columns]
         
-        # Clean numeric data: Remove $, commas, and handle empty cells
-        cols_to_fix = ['Annual Demand (D)', 'Annual Value', 'EOQ', 'Unit Cost (C)', 'Reorder Point (ROP)']
-        for col in cols_to_fix:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col].astype(str).str.replace('[$,]', '', regex=True), errors='coerce').fillna(0)
-                # Plotly 'size' parameter crashes on negative or zero. Force a tiny positive value for the chart.
-                if col == 'EOQ':
-                    df['EOQ_Size'] = df[col].apply(lambda x: x if x > 0 else 0.1)
+        # --- ROBUST COLUMN MAPPING ---
+        mapping = {
+            'Article': ['article', 'item'],
+            'Class ABC': ['class', 'abc', 'cat'],
+            'Demand': ['demand', 'consommation', 'd'],
+            'EOQ': ['eoq', 'optimal', 'q*'],
+            'Value': ['value', 'valeur', 'annual value']
+        }
         
+        final_mapping = {}
+        for std, keys in mapping.items():
+            for col in df.columns:
+                if any(k in col.lower() for k in keys):
+                    final_mapping[col] = std
+                    break
+        df = df.rename(columns=final_mapping)
+
+        # Force Numeric and Cleanup
+        numeric_cols = ['Demand', 'EOQ', 'Value']
+        for c in numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c].astype(str).str.replace('[$,]', '', regex=True), errors='coerce').fillna(0)
+                if c == 'EOQ':
+                    df['EOQ_Size'] = df[c].apply(lambda x: x if x > 0 else 0.5)
+
         return df, "Success"
     except Exception as e:
         return pd.DataFrame(), f"Error: {str(e)}"
@@ -57,32 +90,26 @@ with c2:
 
 df = st.session_state.inventory_data
 
-# --- DEBUGGING TOOL (Hidden by default) ---
-with st.expander("🛠️ Debug: View Spreadsheet Columns"):
-    st.write("Columns found in your Google Sheet:")
-    st.write(list(df.columns))
-
 if df.empty:
-    st.error("No data found. Please check your Google Sheet link.")
+    st.error("Data could not be loaded. Please ensure your Google Sheet is published to web as CSV.")
     st.stop()
 
-# --- SIDEBAR ---
-abc_col = 'Class ABC' if 'Class ABC' in df.columns else df.columns[1] # fallback to 2nd col
-abc_options = sorted(list(df[abc_col].unique()))
-abc_filter = st.sidebar.multiselect(f"Filter {abc_col}", options=abc_options, default=abc_options)
-
-filtered_df = df[df[abc_col].isin(abc_filter)]
+# --- SIDEBAR FILTERS ---
+# Safely find ABC Column
+abc_col = 'Class ABC' if 'Class ABC' in df.columns else None
+if abc_col:
+    abc_options = sorted(list(df[abc_col].unique()))
+    abc_filter = st.sidebar.multiselect(f"Filter {abc_col}", options=abc_options, default=abc_options)
+    filtered_df = df[df[abc_col].isin(abc_filter)]
+else:
+    filtered_df = df
 
 # --- KPI ROW ---
 k1, k2, k3, k4 = st.columns(4)
-# Checking column existence before math to prevent crashes
-val_col = 'Annual Value' if 'Annual Value' in df.columns else None
-eoq_col = 'EOQ' if 'EOQ' in df.columns else None
-
-k1.metric("Total Value", f"${filtered_df[val_col].sum():,.0f}" if val_col else "$0")
-k2.metric("Avg EOQ", f"{filtered_df[eoq_col].mean():.0f}" if eoq_col else "0")
+k1.metric("Total Value", f"${filtered_df['Value'].sum():,.0f}" if 'Value' in filtered_df.columns else "$0")
+k2.metric("Avg EOQ", f"{filtered_df['EOQ'].mean():.0f}" if 'EOQ' in filtered_df.columns else "0")
 k3.metric("SKU Count", len(filtered_df))
-k4.metric("Active Classes", ", ".join(abc_filter))
+k4.metric("Status", "Connected ✅")
 
 st.markdown("---")
 
@@ -92,31 +119,26 @@ if not filtered_df.empty:
     
     with chart_1:
         st.subheader("Inventory Distribution")
-        # Checking for required chart columns
-        needed = ['Annual Demand (D)', 'Annual Value', 'EOQ_Size', 'Article', 'Class ABC']
-        if all(c in filtered_df.columns for c in needed):
-            try:
-                fig = px.scatter(
-                    filtered_df, 
-                    x="Annual Demand (D)", 
-                    y="Annual Value", 
-                    size="EOQ_Size", 
-                    color="Class ABC",
-                    hover_name="Article",
-                    color_discrete_sequence=['#00FFA3', '#BB86FC', '#848E9C'],
-                    size_max=40
-                )
-                fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Chart Error: {e}")
-        else:
-            st.warning("Missing columns for scatter chart. Ensure 'Annual Demand (D)', 'Annual Value', and 'EOQ' are in your sheet.")
+        try:
+            fig = px.scatter(
+                filtered_df, 
+                x="Demand", 
+                y="Value", 
+                size="EOQ_Size" if 'EOQ_Size' in filtered_df.columns else None, 
+                color="Class ABC" if 'Class ABC' in filtered_df.columns else None,
+                hover_name="Article" if 'Article' in filtered_df.columns else None,
+                color_discrete_sequence=['#00FFA3', '#BB86FC', '#848E9C'],
+                size_max=40
+            )
+            fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+            st.plotly_chart(fig, use_container_width=True)
+        except:
+            st.info("Add more data to generate the scatter chart.")
             
     with chart_2:
         st.subheader("Value Split")
-        if val_col and abc_col:
-            fig_pie = px.pie(filtered_df, values=val_col, names=abc_col, hole=0.7,
+        if 'Value' in filtered_df.columns and 'Class ABC' in filtered_df.columns:
+            fig_pie = px.pie(filtered_df, values='Value', names='Class ABC', hole=0.7,
                              color_discrete_sequence=['#00FFA3', '#BB86FC', '#2D333B'])
             fig_pie.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', showlegend=False)
             st.plotly_chart(fig_pie, use_container_width=True)
